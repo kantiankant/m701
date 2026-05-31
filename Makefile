@@ -7,6 +7,7 @@ LDFLAGS= ${LIBS}
 BINDIR?=/usr/local/bin
 
 .SUFFIXES: .c .o
+.PHONY: all clean install uninstall
 
 .c.o:
 	${CC} ${CFLAGS} -c $< -o $@
