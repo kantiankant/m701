@@ -4,6 +4,8 @@
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
+#include <unistd.h>
+#include <pthread.h>
 #include <alsa/asoundlib.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -15,6 +17,7 @@
 
 char dir[P], *files[MAX], buf[P*2], playing[P], err[P];
 int n, sel, st;
+volatile int stop, alive;
 
 void c(int y, const char *s) { int x = (COLS - strlen(s)) / 2; mvprintw(y, x < 0 ? 0 : x, "%s", s); }
 
@@ -40,7 +43,7 @@ void scan() {
 }
 
 void draw() {
-    clear();
+    erase();
     int y = 0, vis = (LINES - 5) / 2;
     c(y++, dir); y++;
     if (sel < st) st = sel;
@@ -50,7 +53,7 @@ void draw() {
         c(y++, files[i]);
         if (i == sel) attroff(A_REVERSE);
     }
-    if (playing[0]) { snprintf(buf, sizeof(buf), "> %s", playing); c(LINES - 7, buf); }
+    if (alive && playing[0]) { snprintf(buf, sizeof(buf), "> %s", playing); c(LINES - 7, buf); }
     if (err[0]) { attron(A_BOLD); c(LINES - 6, err); attroff(A_BOLD); }
     c(LINES - 2, "q - exit | r - reinit");
     c(LINES - 1, "enter - play");
@@ -62,14 +65,15 @@ void prompt() {
     int pl = strlen(pr), p = strlen(dir);
     curs_set(1);
     while (1) {
-        clear();
+        erase();
         mvprintw(LINES / 2, (COLS - pl - p) / 2, "%s%s", pr, dir);
         move(LINES / 2, (COLS - pl - p) / 2 + pl + p);
         refresh();
         int ch = getch();
         if (ch == '\n') break;
-        if (ch == 127 || ch == '\b') { if (p) dir[--p] = 0; }
+        if (ch == 127 || ch == '\b' || ch == KEY_BACKSPACE) { if (p) dir[--p] = 0; }
         else if (p < P - 1 && ch >= 32 && ch < 127) { dir[p++] = ch; dir[p] = 0; }
+        else if (ch == KEY_RESIZE) { }
     }
     curs_set(0);
     FILE *out = fopen(".m", "w");
@@ -81,9 +85,18 @@ void load() {
     if (in) { fgets(dir, P, in); fclose(in); dir[strcspn(dir, "\n")] = 0; }
 }
 
-void play(const char *path) {
+void stop_play() {
+    if (!alive) return;
+    stop = 1;
+    while (alive) usleep(10000);
+}
+
+void *play_thread(void *arg) {
+    char *path = arg;
     av_log_set_level(AV_LOG_QUIET);
     err[0] = 0;
+    alive = 1;
+    stop = 0;
     AVFormatContext *fmt = NULL;
     AVCodecContext *ctx = NULL;
     snd_pcm_t *pcm = NULL;
@@ -128,8 +141,10 @@ void play(const char *path) {
     out = malloc(48000 * 4);
 
     while (av_read_frame(fmt, pkt) >= 0) {
+        if (stop) goto clean;
         if (pkt->stream_index == si && avcodec_send_packet(ctx, pkt) >= 0) {
             while (avcodec_receive_frame(ctx, frame) >= 0) {
+                if (stop) goto clean;
                 uint8_t *op = (uint8_t*)out;
                 int conv = swr_convert(swr, &op, 48000, (const uint8_t**)frame->data, frame->nb_samples);
                 if (conv > 0) {
@@ -142,6 +157,7 @@ void play(const char *path) {
     }
     avcodec_send_packet(ctx, NULL);
     while (avcodec_receive_frame(ctx, frame) >= 0) {
+        if (stop) goto clean;
         uint8_t *op = (uint8_t*)out;
         int conv = swr_convert(swr, &op, 48000, (const uint8_t**)frame->data, frame->nb_samples);
         if (conv > 0) snd_pcm_writei(pcm, out, conv);
@@ -158,6 +174,9 @@ clean:
     if (pcm) snd_pcm_close(pcm);
     avcodec_free_context(&ctx);
     avformat_close_input(&fmt);
+    free(path);
+    alive = 0;
+    return NULL;
 }
 
 int main() {
@@ -168,18 +187,20 @@ int main() {
     while (1) {
         draw();
         int ch = getch();
-        if (ch == 'q') break;
-        if (ch == 'r') { err[0] = 0; clear_files(); prompt(); scan(); }
+        if (ch == 'q' || ch == 'Q') { stop_play(); break; }
+        if (ch == 'r' || ch == 'R') { stop_play(); err[0] = 0; clear_files(); prompt(); scan(); }
         if (ch == KEY_UP && sel > 0) sel--;
         if (ch == KEY_DOWN && sel < n - 1) sel++;
+        if (ch == KEY_RESIZE) { }
         if (ch == '\n' && n > 0) {
-            char path[P*2];
+            stop_play();
+            char *path = malloc(P*2);
             int dl = strlen(dir);
-            snprintf(path, sizeof(path), "%s%s%s", dir, (dl && dir[dl-1] == '/') ? "" : "/", files[sel]);
+            snprintf(path, P*2, "%s%s%s", dir, (dl && dir[dl-1] == '/') ? "" : "/", files[sel]);
             snprintf(playing, sizeof(playing), "%s", files[sel]);
-            draw();
-            play(path);
-            playing[0] = 0;
+            pthread_t tid;
+            pthread_create(&tid, NULL, play_thread, path);
+            pthread_detach(tid);
         }
     }
     clear_files();
