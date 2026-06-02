@@ -12,7 +12,8 @@ a dead simple, yet useable music player.
 
 # compiling (void) 
 
-```sudo xbps-install -S alsa-lib-devel ffmpeg-devel ncurses-devel gcc make```
+Dependencies: `sudo xbps-install -S alsa-lib-devel ffmpeg-devel ncurses-devel gcc make`
 
-```gcc m701.c -o m701 -pthread -lncurses -lasound -lavformat -lavcodec -lavutil -lswresample -lm```
+Building: `make`
 
+Install: `sudo/doas make install`
