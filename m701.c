@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <ncurses.h>
 #include <stdlib.h>
@@ -6,23 +7,192 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <alsa/asoundlib.h>
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libavutil/avutil.h>
-#include <libswresample/swresample.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
 
 #define MAX 1024
 #define P 512
 
 char dir[P], *files[MAX], buf[P*2], playing[P], err[P];
 int n, sel, st;
-volatile int stop, alive;
+volatile int stop, alive, song_finished;
+volatile int looping = 0;
+volatile float volume = 1.0f;
+volatile int paused = 0;
+int vim_keys = 0;
+
+ma_decoder *volatile g_dec = NULL;
+ma_device *volatile g_dev = NULL;
+
+void c(int y, const char *s);
+
+void resolve_path(const char *in, char *out, size_t out_len) {
+    if (in[0] == '~') {
+        const char *home = getenv("HOME");
+        if (home) {
+            if (in[1] == '/' || in[1] == '\0') {
+                snprintf(out, out_len, "%s%s", home, in + 1);
+                return;
+            }
+        }
+    }
+    snprintf(out, out_len, "%s", in);
+}
+
+void get_config_path(char *path, size_t len) {
+    const char *home = getenv("HOME");
+    if (home) {
+        snprintf(path, len, "%s/.config/m701/config", home);
+    } else {
+        snprintf(path, len, ".m701_config");
+    }
+}
+
+void load_config() {
+    char path[P*2];
+    get_config_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        dir[0] = '\0';
+        vim_keys = 0;
+        return;
+    }
+    char line[P*2];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strncmp(line, "keybinds=", 9) == 0) {
+            if (strcmp(line + 9, "vim") == 0) {
+                vim_keys = 1;
+            } else {
+                vim_keys = 0;
+            }
+        } else if (strncmp(line, "dir=", 4) == 0) {
+            snprintf(dir, sizeof(dir), "%s", line + 4);
+        }
+    }
+    fclose(f);
+}
+
+void save_config() {
+    char path[P*2];
+    get_config_path(path, sizeof(path));
+    const char *home = getenv("HOME");
+    if (home) {
+        char dir_path[P*2];
+        snprintf(dir_path, sizeof(dir_path), "%s/.config", home);
+        mkdir(dir_path, 0755);
+        snprintf(dir_path, sizeof(dir_path), "%s/.config/m701", home);
+        mkdir(dir_path, 0755);
+    }
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "keybinds=%s\n", vim_keys ? "vim" : "normal");
+        fprintf(f, "dir=%s\n", dir);
+        fclose(f);
+    }
+}
+
+void show_keybinds() {
+    erase();
+    int y = LINES / 4;
+    c(y++, "q - exit");
+    c(y++, "r - toggle");
+    c(y++, "enter - play / pause");
+    c(y++, "plus / minus - volume up / down");
+    c(y++, "left / right - fast forward / rewind");
+    c(y++, "j / k - up / down");
+    y++;
+    c(y++, "any key to close");
+    refresh();
+    getch();
+}
+
+void config_menu() {
+    int conf_sel = 0;
+    int editing_dir = 0;
+    curs_set(0);
+    
+    while (1) {
+        erase();
+        int y = LINES / 4;
+        
+        char dir_str[P*3];
+        snprintf(dir_str, sizeof(dir_str), "dir - %s%s", dir, editing_dir ? "_" : "");
+        if (conf_sel == 0) {
+            attron(A_REVERSE);
+            c(y++, dir_str);
+            attroff(A_REVERSE);
+        } else {
+            c(y++, dir_str);
+        }
+        
+        y += 2;
+        
+        char keys_str[64];
+        snprintf(keys_str, sizeof(keys_str), "keys - %s", vim_keys ? "vim" : "normal");
+        if (conf_sel == 1) {
+            attron(A_REVERSE);
+            c(y++, keys_str);
+            attroff(A_REVERSE);
+        } else {
+            c(y++, keys_str);
+        }
+        
+        y += 2;
+        if (editing_dir) {
+            c(y++, "enter to enter.");
+        } else {
+            c(y++, "q / esc to save.");
+            if (conf_sel == 0) {
+                c(y++, "enter to edit.");
+            } else if (conf_sel == 1) {
+                c(y++, "up/down - j/k vice versa.");
+            }
+        }
+        
+        refresh();
+        int ch = getch();
+        
+        if (editing_dir) {
+            int p = strlen(dir);
+            if (ch == '\n' || ch == 27) {
+                editing_dir = 0;
+                curs_set(0);
+            } else if (ch == 127 || ch == '\b' || ch == KEY_BACKSPACE) {
+                if (p) dir[--p] = '\0';
+            } else if (p < P - 1 && ch >= 32 && ch < 127) {
+                dir[p++] = ch;
+                dir[p] = '\0';
+            }
+        } else {
+            if (ch == 'q' || ch == 'Q' || ch == 27) {
+                break;
+            }
+            if (ch == KEY_UP || ch == 'k') {
+                conf_sel = 0;
+            }
+            if (ch == KEY_DOWN || ch == 'j') {
+                conf_sel = 1;
+            }
+            if (ch == '\n' || ch == ' ') {
+                if (conf_sel == 0) {
+                    editing_dir = 1;
+                    curs_set(1);
+                } else if (conf_sel == 1) {
+                    vim_keys = !vim_keys;
+                }
+            }
+        }
+    }
+    save_config();
+}
 
 void c(int y, const char *s) { int x = (COLS - strlen(s)) / 2; mvprintw(y, x < 0 ? 0 : x, "%s", s); }
 
 int audio(const char *f) {
-    const char *e[] = {".mp3",".flac",".wav",".ogg",".m4a",0};
+    const char *e[] = {".mp3",".flac",".wav",0};
     const char *d = strrchr(f, '.');
     if (!d) return 0;
     for (int i = 0; e[i]; i++) if (!strcasecmp(d, e[i])) return 1;
@@ -35,7 +205,9 @@ void clear_files() {
 }
 
 void scan() {
-    DIR *d = opendir(dir);
+    char rdir[P*2];
+    resolve_path(dir, rdir, sizeof(rdir));
+    DIR *d = opendir(rdir);
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) && n < MAX) if (audio(e->d_name)) files[n++] = strdup(e->d_name);
@@ -53,37 +225,15 @@ void draw() {
         c(y++, files[i]);
         if (i == sel) attroff(A_REVERSE);
     }
-    if (alive && playing[0]) { snprintf(buf, sizeof(buf), "> %s", playing); c(LINES - 7, buf); }
+    if (alive && playing[0]) { snprintf(buf, sizeof(buf), "> %s [%d%%]", playing, (int)(volume * 100)); c(LINES - 7, buf); }
     if (err[0]) { attron(A_BOLD); c(LINES - 6, err); attroff(A_BOLD); }
-    c(LINES - 2, "q - exit | r - reinit");
-    c(LINES - 1, "enter - play");
+    snprintf(buf, sizeof(buf), "q - exit | r - loop (%s)", looping ? "on" : "off");
+    c(LINES - 2, buf);
+    c(LINES - 1, "h - keybinds | F1 - config");
     refresh();
 }
 
-void prompt() {
-    const char *pr = "dir: ";
-    int pl = strlen(pr), p = strlen(dir);
-    curs_set(1);
-    while (1) {
-        erase();
-        mvprintw(LINES / 2, (COLS - pl - p) / 2, "%s%s", pr, dir);
-        move(LINES / 2, (COLS - pl - p) / 2 + pl + p);
-        refresh();
-        int ch = getch();
-        if (ch == '\n') break;
-        if (ch == 127 || ch == '\b' || ch == KEY_BACKSPACE) { if (p) dir[--p] = 0; }
-        else if (p < P - 1 && ch >= 32 && ch < 127) { dir[p++] = ch; dir[p] = 0; }
-        else if (ch == KEY_RESIZE) { }
-    }
-    curs_set(0);
-    FILE *out = fopen(".m", "w");
-    if (out) { fprintf(out, "%s\n", dir); fclose(out); }
-}
 
-void load() {
-    FILE *in = fopen(".m", "r");
-    if (in) { fgets(dir, P, in); fclose(in); dir[strcspn(dir, "\n")] = 0; }
-}
 
 void stop_play() {
     if (!alive) return;
@@ -91,116 +241,151 @@ void stop_play() {
     while (alive) usleep(10000);
 }
 
+void data_callback(ma_device *dev, void *out, const void *in, ma_uint32 count) {
+    ma_decoder *dec = (ma_decoder*)dev->pUserData;
+    ma_uint64 read = 0;
+    ma_decoder_read_pcm_frames(dec, out, count, &read);
+    if (read < count) {
+        if (looping) {
+            ma_decoder_seek_to_pcm_frame(dec, 0);
+            ma_uint64 read2 = 0;
+            char* out_ptr = (char*)out + read * ma_get_bytes_per_frame(dec->outputFormat, dec->outputChannels);
+            ma_decoder_read_pcm_frames(dec, out_ptr, count - read, &read2);
+            read += read2;
+            if (read < count) {
+                memset((char*)out + read * ma_get_bytes_per_frame(dec->outputFormat, dec->outputChannels), 0, (count - read) * ma_get_bytes_per_frame(dec->outputFormat, dec->outputChannels));
+            }
+        } else {
+            song_finished = 1;
+            memset((char*)out + read * ma_get_bytes_per_frame(dec->outputFormat, dec->outputChannels), 0, (count - read) * ma_get_bytes_per_frame(dec->outputFormat, dec->outputChannels));
+        }
+    }
+    short *samples = (short*)out;
+    ma_uint32 sample_count = count * dec->outputChannels;
+    for (ma_uint32 i = 0; i < sample_count; i++) {
+        int val = (int)(samples[i] * volume);
+        if (val > 32767) val = 32767;
+        if (val < -32768) val = -32768;
+        samples[i] = (short)val;
+    }
+}
+
 void *play_thread(void *arg) {
     char *path = arg;
-    av_log_set_level(AV_LOG_QUIET);
     err[0] = 0;
     alive = 1;
     stop = 0;
-    AVFormatContext *fmt = NULL;
-    AVCodecContext *ctx = NULL;
-    snd_pcm_t *pcm = NULL;
-    SwrContext *swr = NULL;
-    AVPacket *pkt = NULL;
-    AVFrame *frame = NULL;
-    int16_t *out = NULL;
-
-    if (avformat_open_input(&fmt, path, NULL, NULL) < 0) { snprintf(err, sizeof(err), "open"); goto clean; }
-    if (avformat_find_stream_info(fmt, NULL) < 0) { snprintf(err, sizeof(err), "info"); goto clean; }
-    int si = -1;
-    for (unsigned i = 0; i < fmt->nb_streams; i++)
-        if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) { si = i; break; }
-    if (si < 0) { snprintf(err, sizeof(err), "noaudio"); goto clean; }
-    AVCodecParameters *par = fmt->streams[si]->codecpar;
-    const AVCodec *codec = avcodec_find_decoder(par->codec_id);
-    if (!codec) { snprintf(err, sizeof(err), "codec"); goto clean; }
-    ctx = avcodec_alloc_context3(codec);
-    if (!ctx || avcodec_parameters_to_context(ctx, par) < 0 || avcodec_open2(ctx, codec, NULL) < 0) {
-        snprintf(err, sizeof(err), "ctx"); goto clean;
+    song_finished = 0;
+    paused = 0;
+    ma_decoder dec;
+    ma_decoder_config dec_cfg = ma_decoder_config_init(ma_format_s16, 2, 0);
+    if (ma_decoder_init_file(path, &dec_cfg, &dec) != MA_SUCCESS) {
+        snprintf(err, sizeof(err), "open");
+        goto clean;
     }
-    int rate = par->sample_rate;
-    int ich = par->channels ? par->channels : 2;
-    if (snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) { snprintf(err, sizeof(err), "alsa"); goto clean; }
-    snd_pcm_hw_params_t *hw;
-    snd_pcm_hw_params_alloca(&hw);
-    snd_pcm_hw_params_any(pcm, hw);
-    snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16);
-    snd_pcm_hw_params_set_channels(pcm, hw, 2);
-    unsigned int r = rate;
-    snd_pcm_hw_params_set_rate_near(pcm, hw, &r, 0);
-    if (snd_pcm_hw_params(pcm, hw) < 0) { snprintf(err, sizeof(err), "aparams"); goto clean; }
-
-    uint64_t in_layout = av_get_default_channel_layout(ich);
-    uint64_t out_layout = av_get_default_channel_layout(2);
-    swr = swr_alloc_set_opts(NULL, out_layout, AV_SAMPLE_FMT_S16, (int)r, in_layout, ctx->sample_fmt, rate, 0, NULL);
-    if (!swr || swr_init(swr) < 0) { snprintf(err, sizeof(err), "swr"); goto clean; }
-
-    pkt = av_packet_alloc();
-    frame = av_frame_alloc();
-    out = malloc(48000 * 4);
-
-    while (av_read_frame(fmt, pkt) >= 0) {
-        if (stop) goto clean;
-        if (pkt->stream_index == si && avcodec_send_packet(ctx, pkt) >= 0) {
-            while (avcodec_receive_frame(ctx, frame) >= 0) {
-                if (stop) goto clean;
-                uint8_t *op = (uint8_t*)out;
-                int conv = swr_convert(swr, &op, 48000, (const uint8_t**)frame->data, frame->nb_samples);
-                if (conv > 0) {
-                    snd_pcm_sframes_t w = snd_pcm_writei(pcm, out, conv);
-                    if (w < 0) snd_pcm_prepare(pcm);
-                }
-            }
-        }
-        av_packet_unref(pkt);
+    ma_device dev;
+    ma_device_config dev_cfg = ma_device_config_init(ma_device_type_playback);
+    dev_cfg.playback.format = dec.outputFormat;
+    dev_cfg.playback.channels = dec.outputChannels;
+    dev_cfg.sampleRate = dec.outputSampleRate;
+    dev_cfg.dataCallback = data_callback;
+    dev_cfg.pUserData = &dec;
+    if (ma_device_init(NULL, &dev_cfg, &dev) != MA_SUCCESS) {
+        snprintf(err, sizeof(err), "device");
+        ma_decoder_uninit(&dec);
+        goto clean;
     }
-    avcodec_send_packet(ctx, NULL);
-    while (avcodec_receive_frame(ctx, frame) >= 0) {
-        if (stop) goto clean;
-        uint8_t *op = (uint8_t*)out;
-        int conv = swr_convert(swr, &op, 48000, (const uint8_t**)frame->data, frame->nb_samples);
-        if (conv > 0) snd_pcm_writei(pcm, out, conv);
+    g_dec = &dec;
+    g_dev = &dev;
+    if (ma_device_start(&dev) != MA_SUCCESS) {
+        snprintf(err, sizeof(err), "start");
+        g_dec = NULL;
+        g_dev = NULL;
+        ma_device_uninit(&dev);
+        ma_decoder_uninit(&dec);
+        goto clean;
     }
-    uint8_t *op = (uint8_t*)out;
-    swr_convert(swr, &op, 48000, NULL, 0);
-    snd_pcm_drain(pcm);
-
+    while (!stop && !song_finished) usleep(10000);
+    g_dec = NULL;
+    g_dev = NULL;
+    ma_device_uninit(&dev);
+    ma_decoder_uninit(&dec);
 clean:
-    free(out);
-    av_packet_free(&pkt);
-    av_frame_free(&frame);
-    swr_free(&swr);
-    if (pcm) snd_pcm_close(pcm);
-    avcodec_free_context(&ctx);
-    avformat_close_input(&fmt);
     free(path);
     alive = 0;
     return NULL;
 }
 
 int main() {
-    initscr(); cbreak(); noecho(); keypad(stdscr, 1); curs_set(1);
-    load();
-    prompt();
+    initscr(); cbreak(); noecho(); keypad(stdscr, 1);
+    load_config();
+    config_menu();
     scan();
     while (1) {
         draw();
         int ch = getch();
         if (ch == 'q' || ch == 'Q') { stop_play(); break; }
-        if (ch == 'r' || ch == 'R') { stop_play(); err[0] = 0; clear_files(); prompt(); scan(); }
-        if (ch == KEY_UP && sel > 0) sel--;
-        if (ch == KEY_DOWN && sel < n - 1) sel++;
+        if (ch == 'r' || ch == 'R') { looping = !looping; }
+        if (ch == 'h' || ch == 'H') { show_keybinds(); }
+        if (ch == KEY_F(1)) {
+            stop_play();
+            clear_files();
+            config_menu();
+            scan();
+        }
+        if ((ch == KEY_UP || (vim_keys && ch == 'k')) && sel > 0) sel--;
+        if ((ch == KEY_DOWN || (vim_keys && ch == 'j')) && sel < n - 1) sel++;
+        if (ch == KEY_LEFT) {
+            if (alive && g_dec && g_dev) {
+                ma_uint64 cursor = 0;
+                ma_device_stop(g_dev);
+                ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
+                ma_uint64 step = 10 * g_dec->outputSampleRate;
+                ma_uint64 target = (cursor > step) ? (cursor - step) : 0;
+                ma_decoder_seek_to_pcm_frame(g_dec, target);
+                if (!paused) ma_device_start(g_dev);
+            }
+        }
+        if (ch == KEY_RIGHT || (vim_keys && ch == 'l')) {
+            if (alive && g_dec && g_dev) {
+                ma_uint64 cursor = 0;
+                ma_device_stop(g_dev);
+                ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
+                ma_uint64 step = 10 * g_dec->outputSampleRate;
+                ma_decoder_seek_to_pcm_frame(g_dec, cursor + step);
+                if (!paused) ma_device_start(g_dev);
+            }
+        }
+        if (ch == '+' || ch == '=') {
+            volume += 0.05f;
+            if (volume > 1.0f) volume = 1.0f;
+        }
+        if (ch == '-') {
+            volume -= 0.05f;
+            if (volume < 0.0f) volume = 0.0f;
+        }
         if (ch == KEY_RESIZE) { }
         if (ch == '\n' && n > 0) {
-            stop_play();
-            char *path = malloc(P*2);
-            int dl = strlen(dir);
-            snprintf(path, P*2, "%s%s%s", dir, (dl && dir[dl-1] == '/') ? "" : "/", files[sel]);
-            snprintf(playing, sizeof(playing), "%s", files[sel]);
-            pthread_t tid;
-            pthread_create(&tid, NULL, play_thread, path);
-            pthread_detach(tid);
+            if (alive && strcmp(playing, files[sel]) == 0) {
+                if (paused) {
+                    ma_device_start(g_dev);
+                    paused = 0;
+                } else {
+                    ma_device_stop(g_dev);
+                    paused = 1;
+                }
+            } else {
+                stop_play();
+                char *path = malloc(P*2);
+                char rdir[P*2];
+                resolve_path(dir, rdir, sizeof(rdir));
+                int dl = strlen(rdir);
+                snprintf(path, P*2, "%s%s%s", rdir, (dl && rdir[dl-1] == '/') ? "" : "/", files[sel]);
+                snprintf(playing, sizeof(playing), "%s", files[sel]);
+                pthread_t tid;
+                pthread_create(&tid, NULL, play_thread, path);
+                pthread_detach(tid);
+            }
         }
     }
     clear_files();
