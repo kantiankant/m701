@@ -2,7 +2,7 @@ CFILES=m701.c
 OFILES=${CFILES:.c=.o}
 TARG=m701
 CFLAGS=-std=c99
-LIBS=-pthread -lncurses -lasound -lavformat -lavcodec -lavutil -lswresample -lm
+LIBS=-pthread -lncurses -lasound -lm -ldl
 LDFLAGS= ${LIBS}
 BINDIR?=/usr/local/bin
 
