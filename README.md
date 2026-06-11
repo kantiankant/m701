@@ -10,10 +10,14 @@ a dead simple, yet useable music player.
 - me
 - people who want a plug and play but non-bloated tui music player
 
-# compiling (void) 
+# deps
 
-Dependencies: `sudo xbps-install -S alsa-lib-devel ffmpeg-devel ncurses-devel gcc make`
+- void - ```gcc make ncurses-devel alsa-lib-devel```
 
-Building: `make`
+- debian/devuan - ```build-essential libncurses-dev libasound2-dev```
 
-Install: `sudo/doas make install`
+- fedora/redhat - ```gcc make ncurses-devel alsa-lib-devel```
+
+# compiling
+
+```make```
