@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include <stdio.h>
-#include <ncurses.h>
+#include <curses.h>  
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -9,6 +9,8 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <locale.h> 
+#include <wchar.h>
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
@@ -28,6 +30,15 @@ ma_device *volatile g_dev = NULL;
 
 void c(int y, const char *s);
 
+int utf8_width(const char *s) {
+    int len = 0;
+    while (*s) {
+        if ((*s & 0xc0) != 0x80) len++; 
+        s++;
+    }
+    return len;
+}
+
 void resolve_path(const char *in, char *out, size_t out_len) {
     if (in[0] == '~') {
         const char *home = getenv("HOME");
@@ -44,7 +55,7 @@ void resolve_path(const char *in, char *out, size_t out_len) {
 void get_config_path(char *path, size_t len) {
     const char *home = getenv("HOME");
     if (home) {
-        snprintf(path, len, "%s/.config/m701/config", home);
+        snprintf(path, len, "%s/.config/player/config", home);
     } else {
         snprintf(path, len, ".m701_config");
     }
@@ -99,7 +110,7 @@ void show_keybinds() {
     int y = LINES / 4;
     c(y++, "q - exit");
     c(y++, "r - toggle");
-    c(y++, "enter - play / pause");
+    c(y++, "enter / space - play / pause");
     c(y++, "plus / minus - volume up / down");
     c(y++, "left / right - fast forward / rewind");
     c(y++, "j / k - up / down");
@@ -161,7 +172,10 @@ void config_menu() {
                 editing_dir = 0;
                 curs_set(0);
             } else if (ch == 127 || ch == '\b' || ch == KEY_BACKSPACE) {
-                if (p) dir[--p] = '\0';
+                if (p) {
+                    while (p > 0 && (dir[--p] & 0xc0) == 0x80);
+                    dir[p] = '\0';
+                }
             } else if (p < P - 1 && ch >= 32 && ch < 127) {
                 dir[p++] = ch;
                 dir[p] = '\0';
@@ -189,7 +203,10 @@ void config_menu() {
     save_config();
 }
 
-void c(int y, const char *s) { int x = (COLS - strlen(s)) / 2; mvprintw(y, x < 0 ? 0 : x, "%s", s); }
+void c(int y, const char *s) { 
+    int x = (COLS - utf8_width(s)) / 2; 
+    mvprintw(y, x < 0 ? 0 : x, "%s", s); 
+}
 
 int audio(const char *f) {
     const char *e[] = {".mp3",".flac",".wav",0};
@@ -232,8 +249,6 @@ void draw() {
     c(LINES - 1, "h - keybinds | F1 - config");
     refresh();
 }
-
-
 
 void stop_play() {
     if (!alive) return;
@@ -317,6 +332,7 @@ clean:
 }
 
 int main() {
+    setlocale(LC_ALL, "");
     initscr(); cbreak(); noecho(); keypad(stdscr, 1);
     load_config();
     config_menu();
@@ -365,7 +381,8 @@ int main() {
             if (volume < 0.0f) volume = 0.0f;
         }
         if (ch == KEY_RESIZE) { }
-        if (ch == '\n' && n > 0) {
+        
+        if ((ch == '\n' || ch == ' ') && n > 0) {
             if (alive && strcmp(playing, files[sel]) == 0) {
                 if (paused) {
                     ma_device_start(g_dev);
