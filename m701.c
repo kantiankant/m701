@@ -1,6 +1,9 @@
 #define _GNU_SOURCE
 #include <stdio.h>
-#include <curses.h>  
+#include <locale.h> 
+#include <wchar.h>  
+#define NCURSES_WIDECHAR 1
+#include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -9,8 +12,6 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <locale.h> 
-#include <wchar.h>
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
@@ -29,15 +30,6 @@ ma_decoder *volatile g_dec = NULL;
 ma_device *volatile g_dev = NULL;
 
 void c(int y, const char *s);
-
-int utf8_width(const char *s) {
-    int len = 0;
-    while (*s) {
-        if ((*s & 0xc0) != 0x80) len++; 
-        s++;
-    }
-    return len;
-}
 
 void resolve_path(const char *in, char *out, size_t out_len) {
     if (in[0] == '~') {
@@ -110,7 +102,7 @@ void show_keybinds() {
     int y = LINES / 4;
     c(y++, "q - exit");
     c(y++, "r - toggle");
-    c(y++, "enter / space - play / pause");
+    c(y++, "enter - play / pause");
     c(y++, "plus / minus - volume up / down");
     c(y++, "left / right - fast forward / rewind");
     c(y++, "j / k - up / down");
@@ -173,7 +165,9 @@ void config_menu() {
                 curs_set(0);
             } else if (ch == 127 || ch == '\b' || ch == KEY_BACKSPACE) {
                 if (p) {
-                    while (p > 0 && (dir[--p] & 0xc0) == 0x80);
+                    do {
+                        p--;
+                    } while (p > 0 && (dir[p] & 0xC0) == 0x80);
                     dir[p] = '\0';
                 }
             } else if (p < P - 1 && ch >= 32 && ch < 127) {
@@ -203,8 +197,18 @@ void config_menu() {
     save_config();
 }
 
+int utf8_visible_length(const char *s) {
+    int len = 0;
+    while (*s) {
+        if ((*s & 0xC0) != 0x80) len++; 
+        s++;
+    }
+    return len;
+}
+
 void c(int y, const char *s) { 
-    int x = (COLS - utf8_width(s)) / 2; 
+    int v_len = utf8_visible_length(s);
+    int x = (COLS - v_len) / 2; 
     mvprintw(y, x < 0 ? 0 : x, "%s", s); 
 }
 
@@ -332,7 +336,7 @@ clean:
 }
 
 int main() {
-    setlocale(LC_ALL, "");
+    setlocale(LC_ALL, ""); 
     initscr(); cbreak(); noecho(); keypad(stdscr, 1);
     load_config();
     config_menu();
@@ -368,7 +372,8 @@ int main() {
                 ma_device_stop(g_dev);
                 ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
                 ma_uint64 step = 10 * g_dec->outputSampleRate;
-                ma_decoder_seek_to_pcm_frame(g_dec, cursor + step);
+                ma_uint64 target = cursor + step;
+                ma_decoder_seek_to_pcm_frame(g_dec, target);
                 if (!paused) ma_device_start(g_dev);
             }
         }
@@ -381,8 +386,7 @@ int main() {
             if (volume < 0.0f) volume = 0.0f;
         }
         if (ch == KEY_RESIZE) { }
-        
-        if ((ch == '\n' || ch == ' ') && n > 0) {
+        if (ch == '\n' && n > 0) {
             if (alive && strcmp(playing, files[sel]) == 0) {
                 if (paused) {
                     ma_device_start(g_dev);
