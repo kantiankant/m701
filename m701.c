@@ -1,5 +1,8 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <locale.h> 
+#include <wchar.h>  
+#define NCURSES_WIDECHAR 1
 #include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,7 +164,12 @@ void config_menu() {
                 editing_dir = 0;
                 curs_set(0);
             } else if (ch == 127 || ch == '\b' || ch == KEY_BACKSPACE) {
-                if (p) dir[--p] = '\0';
+                if (p) {
+                    do {
+                        p--;
+                    } while (p > 0 && (dir[p] & 0xC0) == 0x80);
+                    dir[p] = '\0';
+                }
             } else if (p < P - 1 && ch >= 32 && ch < 127) {
                 dir[p++] = ch;
                 dir[p] = '\0';
@@ -189,7 +197,20 @@ void config_menu() {
     save_config();
 }
 
-void c(int y, const char *s) { int x = (COLS - strlen(s)) / 2; mvprintw(y, x < 0 ? 0 : x, "%s", s); }
+int utf8_visible_length(const char *s) {
+    int len = 0;
+    while (*s) {
+        if ((*s & 0xC0) != 0x80) len++; 
+        s++;
+    }
+    return len;
+}
+
+void c(int y, const char *s) { 
+    int v_len = utf8_visible_length(s);
+    int x = (COLS - v_len) / 2; 
+    mvprintw(y, x < 0 ? 0 : x, "%s", s); 
+}
 
 int audio(const char *f) {
     const char *e[] = {".mp3",".flac",".wav",0};
@@ -232,8 +253,6 @@ void draw() {
     c(LINES - 1, "h - keybinds | F1 - config");
     refresh();
 }
-
-
 
 void stop_play() {
     if (!alive) return;
@@ -317,6 +336,7 @@ clean:
 }
 
 int main() {
+    setlocale(LC_ALL, ""); 
     initscr(); cbreak(); noecho(); keypad(stdscr, 1);
     load_config();
     config_menu();
@@ -352,7 +372,8 @@ int main() {
                 ma_device_stop(g_dev);
                 ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
                 ma_uint64 step = 10 * g_dec->outputSampleRate;
-                ma_decoder_seek_to_pcm_frame(g_dec, cursor + step);
+                ma_uint64 target = cursor + step;
+                ma_decoder_seek_to_pcm_frame(g_dec, target);
                 if (!paused) ma_device_start(g_dev);
             }
         }
