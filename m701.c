@@ -55,7 +55,7 @@ void resolve_path(const char *in, char *out, size_t out_len) {
 void get_config_path(char *path, size_t len) {
     const char *home = getenv("HOME");
     if (home) {
-        snprintf(path, len, "%s/.config/player/config", home);
+        snprintf(path, len, "%s/.config/m701/config", home);
     } else {
         snprintf(path, len, ".m701_config");
     }
