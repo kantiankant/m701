@@ -5,6 +5,15 @@ a dead simple, yet useable music player.
 
 "Aim to create a system that is simple, transparent, and easy to pick up, without having to give up practicality and a rich feature set."
 
+# features
+
+- a really cool and simple distraction-free ui
+- pausing and playing!?
+- audio volume control
+- vim keys
+- looping!?
+- fast forwarding and rewinding!?
+
 # who this is for 
 
 - me
