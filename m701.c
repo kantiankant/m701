@@ -466,3 +466,4 @@ int main() {
     clear_files();
     endwin();
     return 0;
+}
