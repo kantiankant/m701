@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
@@ -22,6 +23,7 @@ char dir[P], *files[MAX], buf[P*2], playing[P], err[P];
 int n, sel, st;
 volatile int stop, alive, song_finished;
 volatile int looping = 0;
+volatile int shuffle = 0;
 volatile float volume = 1.0f;
 volatile int paused = 0;
 int vim_keys = 0;
@@ -101,7 +103,8 @@ void show_keybinds() {
     erase();
     int y = LINES / 4;
     c(y++, "q - exit");
-    c(y++, "r - toggle");
+    c(y++, "r - toggle loop");
+    c(y++, "s - toggle shuffle");
     c(y++, "enter - play / pause");
     c(y++, "plus / minus - volume up / down");
     c(y++, "left / right - fast forward / rewind");
@@ -237,18 +240,49 @@ void scan() {
 
 void draw() {
     erase();
-    int y = 0, vis = (LINES - 5) / 2;
+    int y = 0, vis = (LINES > 10) ? (LINES - 10) : 1;
     c(y++, dir); y++;
     if (sel < st) st = sel;
     if (sel >= st + vis) st = sel - vis + 1;
-    for (int i = st; i < n && y < LINES - 3; i++) {
+    for (int i = st; i < n && y < LINES - 8; i++) {
         if (i == sel) attron(A_REVERSE);
         c(y++, files[i]);
         if (i == sel) attroff(A_REVERSE);
     }
-    if (alive && playing[0]) { snprintf(buf, sizeof(buf), "> %s [%d%%]", playing, (int)(volume * 100)); c(LINES - 7, buf); }
+    if (alive && playing[0]) {
+        snprintf(buf, sizeof(buf), "> %s [%d%%]", playing, (int)(volume * 100));
+        c(LINES - 7, buf);
+        ma_decoder *dec = g_dec;
+        if (dec) {
+            ma_uint64 cursor = 0;
+            ma_uint64 total = 0;
+            ma_decoder_get_cursor_in_pcm_frames(dec, &cursor);
+            ma_decoder_get_length_in_pcm_frames(dec, &total);
+            double cur_sec = (double)cursor / (dec->outputSampleRate ? dec->outputSampleRate : 44100);
+            double tot_sec = (double)total / (dec->outputSampleRate ? dec->outputSampleRate : 44100);
+            int cur_min = (int)cur_sec / 60;
+            int cur_s = (int)cur_sec % 60;
+            int tot_min = (int)tot_sec / 60;
+            int tot_s = (int)tot_sec % 60;
+            int bar_width = 30;
+            char progress_bar[64];
+            int filled = (tot_sec > 0) ? (int)((cur_sec / tot_sec) * bar_width) : 0;
+            if (filled > bar_width) filled = bar_width;
+            int p_idx = 0;
+            progress_bar[p_idx++] = '[';
+            for (int i = 0; i < bar_width; i++) {
+                if (i < filled) progress_bar[p_idx++] = '=';
+                else if (i == filled) progress_bar[p_idx++] = '>';
+                else progress_bar[p_idx++] = ' ';
+            }
+            progress_bar[p_idx++] = ']';
+            progress_bar[p_idx] = '\0';
+            snprintf(buf, sizeof(buf), "%s %02d:%02d / %02d:%02d", progress_bar, cur_min, cur_s, tot_min, tot_s);
+            c(LINES - 5, buf);
+        }
+    }
     if (err[0]) { attron(A_BOLD); c(LINES - 6, err); attroff(A_BOLD); }
-    snprintf(buf, sizeof(buf), "q - exit | r - loop (%s)", looping ? "on" : "off");
+    snprintf(buf, sizeof(buf), "q - exit | r - loop (%s) | s - shuffle (%s)", looping ? "on" : "off", shuffle ? "on" : "off");
     c(LINES - 2, buf);
     c(LINES - 1, "h - keybinds | F1 - config");
     refresh();
@@ -335,9 +369,24 @@ clean:
     return NULL;
 }
 
+void play_current() {
+    stop_play();
+    char *path = malloc(P*2);
+    char rdir[P*2];
+    resolve_path(dir, rdir, sizeof(rdir));
+    int dl = strlen(rdir);
+    snprintf(path, P*2, "%s%s%s", rdir, (dl && rdir[dl-1] == '/') ? "" : "/", files[sel]);
+    snprintf(playing, sizeof(playing), "%s", files[sel]);
+    pthread_t tid;
+    pthread_create(&tid, NULL, play_thread, path);
+    pthread_detach(tid);
+}
+
 int main() {
+    srand(time(NULL));
     setlocale(LC_ALL, ""); 
     initscr(); cbreak(); noecho(); keypad(stdscr, 1);
+    timeout(100);
     load_config();
     config_menu();
     scan();
@@ -345,71 +394,75 @@ int main() {
         draw();
         int ch = getch();
         if (ch == 'q' || ch == 'Q') { stop_play(); break; }
-        if (ch == 'r' || ch == 'R') { looping = !looping; }
-        if (ch == 'h' || ch == 'H') { show_keybinds(); }
-        if (ch == KEY_F(1)) {
-            stop_play();
-            clear_files();
-            config_menu();
-            scan();
-        }
-        if ((ch == KEY_UP || (vim_keys && ch == 'k')) && sel > 0) sel--;
-        if ((ch == KEY_DOWN || (vim_keys && ch == 'j')) && sel < n - 1) sel++;
-        if (ch == KEY_LEFT) {
-            if (alive && g_dec && g_dev) {
-                ma_uint64 cursor = 0;
-                ma_device_stop(g_dev);
-                ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
-                ma_uint64 step = 10 * g_dec->outputSampleRate;
-                ma_uint64 target = (cursor > step) ? (cursor - step) : 0;
-                ma_decoder_seek_to_pcm_frame(g_dec, target);
-                if (!paused) ma_device_start(g_dev);
-            }
-        }
-        if (ch == KEY_RIGHT || (vim_keys && ch == 'l')) {
-            if (alive && g_dec && g_dev) {
-                ma_uint64 cursor = 0;
-                ma_device_stop(g_dev);
-                ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
-                ma_uint64 step = 10 * g_dec->outputSampleRate;
-                ma_uint64 target = cursor + step;
-                ma_decoder_seek_to_pcm_frame(g_dec, target);
-                if (!paused) ma_device_start(g_dev);
-            }
-        }
-        if (ch == '+' || ch == '=') {
-            volume += 0.05f;
-            if (volume > 1.0f) volume = 1.0f;
-        }
-        if (ch == '-') {
-            volume -= 0.05f;
-            if (volume < 0.0f) volume = 0.0f;
-        }
-        if (ch == KEY_RESIZE) { }
-        if (ch == '\n' && n > 0) {
-            if (alive && strcmp(playing, files[sel]) == 0) {
-                if (paused) {
-                    ma_device_start(g_dev);
-                    paused = 0;
-                } else {
-                    ma_device_stop(g_dev);
-                    paused = 1;
-                }
-            } else {
+        if (ch != ERR) {
+            if (ch == 'r' || ch == 'R') { looping = !looping; }
+            if (ch == 's' || ch == 'S') { shuffle = !shuffle; }
+            if (ch == 'h' || ch == 'H') { show_keybinds(); }
+            if (ch == KEY_F(1)) {
                 stop_play();
-                char *path = malloc(P*2);
-                char rdir[P*2];
-                resolve_path(dir, rdir, sizeof(rdir));
-                int dl = strlen(rdir);
-                snprintf(path, P*2, "%s%s%s", rdir, (dl && rdir[dl-1] == '/') ? "" : "/", files[sel]);
-                snprintf(playing, sizeof(playing), "%s", files[sel]);
-                pthread_t tid;
-                pthread_create(&tid, NULL, play_thread, path);
-                pthread_detach(tid);
+                clear_files();
+                config_menu();
+                scan();
+            }
+            if ((ch == KEY_UP || (vim_keys && ch == 'k')) && sel > 0) sel--;
+            if ((ch == KEY_DOWN || (vim_keys && ch == 'j')) && sel < n - 1) sel++;
+            if (ch == KEY_LEFT) {
+                if (alive && g_dec && g_dev) {
+                    ma_uint64 cursor = 0;
+                    ma_device_stop(g_dev);
+                    ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
+                    ma_uint64 step = 10 * g_dec->outputSampleRate;
+                    ma_uint64 target = (cursor > step) ? (cursor - step) : 0;
+                    ma_decoder_seek_to_pcm_frame(g_dec, target);
+                    if (!paused) ma_device_start(g_dev);
+                }
+            }
+            if (ch == KEY_RIGHT || (vim_keys && ch == 'l')) {
+                if (alive && g_dec && g_dev) {
+                    ma_uint64 cursor = 0;
+                    ma_device_stop(g_dev);
+                    ma_decoder_get_cursor_in_pcm_frames(g_dec, &cursor);
+                    ma_uint64 step = 10 * g_dec->outputSampleRate;
+                    ma_uint64 target = cursor + step;
+                    ma_decoder_seek_to_pcm_frame(g_dec, target);
+                    if (!paused) ma_device_start(g_dev);
+                }
+            }
+            if (ch == '+' || ch == '=') {
+                volume += 0.05f;
+                if (volume > 1.0f) volume = 1.0f;
+            }
+            if (ch == '-') {
+                volume -= 0.05f;
+                if (volume < 0.0f) volume = 0.0f;
+            }
+            if (ch == KEY_RESIZE) { }
+            if (ch == '\n' && n > 0) {
+                if (alive && strcmp(playing, files[sel]) == 0) {
+                    if (paused) {
+                        ma_device_start(g_dev);
+                        paused = 0;
+                    } else {
+                        ma_device_stop(g_dev);
+                        paused = 1;
+                    }
+                } else {
+                    play_current();
+                }
+            }
+        }
+        if (song_finished) {
+            song_finished = 0;
+            if (n > 0) {
+                if (shuffle) {
+                    sel = rand() % n;
+                } else {
+                    sel = (sel + 1) % n;
+                }
+                play_current();
             }
         }
     }
     clear_files();
     endwin();
     return 0;
-}
